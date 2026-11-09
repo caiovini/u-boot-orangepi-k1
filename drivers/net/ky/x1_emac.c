@@ -101,6 +101,7 @@
                                             EQOS_DESCRIPTOR_SIZE, ARCH_DMA_MINALIGN)
 #define EQOS_BUFFER_ALIGN               ARCH_DMA_MINALIGN
 #define EQOS_MAX_PACKET_SIZE            ALIGN(1568, ARCH_DMA_MINALIGN)
+#define EQOS_TX_BUFFER_SIZE             (EQOS_DESCRIPTORS_TX * EQOS_MAX_PACKET_SIZE)
 #define EQOS_RX_BUFFER_SIZE             (EQOS_DESCRIPTORS_RX * EQOS_MAX_PACKET_SIZE)
 #define CACHE_FLUSH_CNT                 (ARCH_DMA_MINALIGN / EQOS_DESCRIPTOR_SIZE)
 
@@ -712,23 +713,55 @@ void emac_stop(struct udevice *dev)
 int emac_send(struct udevice *dev, void *packet, int length)
 {
     struct emac_priv *priv = dev_get_priv(dev);
-    struct emac_desc *tx_desc;
-    int i;
+    struct emac_desc *tx_desc, *prev_desc;
+    int cur_idx, prev_idx, i;
+    void *tx_buf;
 
     debug("%s(dev=%p, packet=%p, length=%d):\n", __func__, dev, packet,
           length);
 
-    memcpy(priv->tx_dma_buf, packet, length);
-    emac_flush_buffer(priv->tx_dma_buf, length);
+    cur_idx = priv->tx_desc_idx;
+    tx_buf = priv->tx_dma_buf + (cur_idx * EQOS_MAX_PACKET_SIZE);
 
-    tx_desc = &priv->tx_descs[priv->tx_desc_idx];
-    priv->tx_desc_idx++;
-    priv->tx_desc_idx %= EQOS_DESCRIPTORS_TX;
+    /*
+     * Copy and flush the outgoing packet into its dedicated ring slot while
+     * the EMAC DMA may still be transmitting the previous frame on the wire.
+     */
+    memcpy(tx_buf, packet, length);
+    emac_flush_buffer(tx_buf, length);
+
+    /*
+     * Because 4 descriptors (4 * 16B = 64B) share a single CPU cache line,
+     * ensure the previous descriptor has completed DMA writeback before
+     * modifying and flushing the shared descriptor cache line.
+     */
+    prev_idx = (cur_idx + EQOS_DESCRIPTORS_TX - 1) % EQOS_DESCRIPTORS_TX;
+    prev_desc = &priv->tx_descs[prev_idx];
+    for (i = 0; i < 1000000; i++) {
+        emac_inval_desc(prev_desc);
+        if (!(readl(&prev_desc->des0) & EMAC_DESC_OWN))
+            break;
+        if (((i + 1) & 0x3f) == 0)
+            emac_wr(priv, DMA_TRANSMIT_POLL_DEMAND, 0xFF);
+        if (i >= 32)
+            udelay(1);
+    }
+    if (i == 1000000) {
+        printf("%s: TX timeout. DMA_STATUS=%08x, MAC_STATUS=%08x, TX_DESC0=%08x\n",
+               __func__,
+               emac_rd(priv, DMA_STATUS_IRQ),
+               emac_rd(priv, MAC_STATUS_IRQ),
+               readl(&prev_desc->des0));
+        return -ETIMEDOUT;
+    }
+
+    tx_desc = &priv->tx_descs[cur_idx];
+    priv->tx_desc_idx = (cur_idx + 1) % EQOS_DESCRIPTORS_TX;
 
     memset(tx_desc, 0x0, sizeof(struct emac_desc));
 
-    tx_desc->des2 = (u32)(ulong)priv->tx_dma_buf;
-    tx_desc->des3 = (u32)((ulong)priv->tx_dma_buf >> 32);
+    tx_desc->des2 = (u32)(ulong)tx_buf;
+    tx_desc->des3 = (u32)((ulong)tx_buf >> 32);
 
     u32 des1 = (EMAC_DESC_BUFF_SIZE1 & length) | EMAC_DESC_FD | EMAC_DESC_LD;
     if (priv->tx_desc_idx == 0)
@@ -743,22 +776,7 @@ int emac_send(struct udevice *dev, void *packet, int length)
 
     emac_wr(priv, DMA_TRANSMIT_POLL_DEMAND, 0xFF);
 
-    for (i = 0; i < 1000000; i++) {
-        emac_inval_desc(tx_desc);
-        if (!(readl(&tx_desc->des0) & EMAC_DESC_OWN))
-            return 0;
-        if (((i + 1) & 0x3f) == 0)
-            emac_wr(priv, DMA_TRANSMIT_POLL_DEMAND, 0xFF);
-        udelay(1);
-    }
-
-    printf("%s: TX timeout. DMA_STATUS=%08x, MAC_STATUS=%08x, TX_DESC0=%08x\n", 
-           __func__, 
-           emac_rd(priv, DMA_STATUS_IRQ),
-           emac_rd(priv, MAC_STATUS_IRQ),
-           readl(&tx_desc->des0));
-
-    return -ETIMEDOUT;
+    return 0;
 }
 
 int emac_recv(struct udevice *dev, int flags, uchar **packetp)
@@ -805,8 +823,6 @@ int emac_free_pkt(struct udevice *dev, uchar *packet, int length)
         return -EINVAL;
     }
 
-    emac_inval_buffer((void *)packet, length);
-
     if (!((priv->rx_desc_idx + 1) % CACHE_FLUSH_CNT)) {
         for (desc_idx = (priv->rx_desc_idx + 1 - CACHE_FLUSH_CNT); desc_idx <= priv->rx_desc_idx; desc_idx++) {
             rx_desc = &priv->rx_descs[desc_idx];
@@ -821,12 +837,11 @@ int emac_free_pkt(struct udevice *dev, uchar *packet, int length)
             rx_desc->des3 = (u32)(buf_addr >> 32);
             asm volatile("fence w, w" ::: "memory");
             rx_desc->des0 = EMAC_DESC_OWN;
-
-            emac_flush_desc(rx_desc);
-            asm volatile("fence rw, io" ::: "memory");
-
-            emac_wr(priv, DMA_RECEIVE_POLL_DEMAND, 0xFF);
         }
+        emac_flush_desc(rx_desc);
+        asm volatile("fence rw, io" ::: "memory");
+
+        emac_wr(priv, DMA_RECEIVE_POLL_DEMAND, 0xFF);
     }
     priv->rx_desc_idx++;
 
@@ -922,7 +937,7 @@ static int emac_probe_resources_core(struct udevice *dev)
     debug("%s: tx_descs=%p, rx_descs=%p\n", __func__, priv->tx_descs,
           priv->rx_descs);
 
-    priv->tx_dma_buf = memalign(EQOS_BUFFER_ALIGN, EQOS_MAX_PACKET_SIZE);
+    priv->tx_dma_buf = memalign(EQOS_BUFFER_ALIGN, EQOS_TX_BUFFER_SIZE);
     if (!priv->tx_dma_buf) {
         debug("%s: memalign(tx_dma_buf) failed\n", __func__);
         ret = -ENOMEM;
